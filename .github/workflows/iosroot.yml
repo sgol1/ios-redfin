@@ -1,0 +1,142 @@
+name: iosroot
+
+# Build the iOS 16.7.16 (iPhone X, 20H392) root image for the bramble port on a Linux runner, the
+# tools/redfin-mkroot-wsl.sh steps (fetch, tools/mkiosroot.sh, sweet-root-tweaks.py, d22ap.adt, per-GiB
+# checksums) without WSL.
+#
+# The image holds Apple's iOS files: it is NEVER uploaded in the clear. It is gzip-compressed and
+# encrypted (openssl AES-256-CTR, PBKDF2) with the IOSROOT_KEY repository secret, whose only other copy
+# is on the owner's PC, then split into parts and uploaded as a 1-day artifact. Decrypt on the PC with
+# tools/bramble-iosroot-win.sh.
+on:
+  push:
+    branches: [iosroot-build]
+  workflow_dispatch:
+
+concurrency:
+  group: iosroot
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      DEV: iPhone10,3
+      BUILD: "20H392"
+      W: /mnt/w
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Key present
+        env:
+          ROOTKEY: ${{ secrets.IOSROOT_KEY }}
+        run: |
+          [ -n "$ROOTKEY" ] || { echo "IOSROOT_KEY secret is missing: refusing to build an unencrypted image"; exit 1; }
+          echo "key length ${#ROOTKEY}"
+
+      - name: Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq hfsprogs rsync pigz fuse3 cmake build-essential libfuse3-dev zlib1g-dev libbz2-dev libattr1-dev libicu-dev git
+          if ! sudo apt-get install -y -qq apfs-fuse; then
+            git clone -q --depth 1 --recursive https://github.com/sgan81/apfs-fuse /tmp/apfs-fuse
+            cmake -S /tmp/apfs-fuse -B /tmp/apfs-fuse/build -DCMAKE_CXX_FLAGS="-include cstdint" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 >/dev/null
+            make -C /tmp/apfs-fuse/build -j"$(nproc)" >/dev/null
+            sudo install -m 0755 /tmp/apfs-fuse/build/apfs-fuse /usr/local/bin/apfs-fuse
+          fi
+          git clone -q --depth 1 https://github.com/lzfse/lzfse /tmp/lzfse
+          cc -O2 -o /tmp/lzfse-bin /tmp/lzfse/src/*.c
+          sudo modprobe hfsplus || sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)" && sudo modprobe hfsplus
+          grep -w hfsplus /proc/filesystems
+          command -v apfs-fuse mkfs.hfsplus fsck.hfsplus rsync pigz
+          sudo mkdir -p "$W" && sudo chown "$USER" "$W"
+          df -h / /mnt
+
+      - name: Fetch IPSW parts from Apple
+        run: |
+          url=$(curl -sfL "https://api.ipsw.me/v4/device/$DEV?type=ipsw" |
+            python3 -c "import json,sys,os; print(next(f['url'] for f in json.load(sys.stdin)['firmwares'] if f['buildid']==os.environ['BUILD']))")
+          echo "IPSW: $url"
+          mkdir -p "$W/ipsw"
+          for p in 087-86698-044.dmg 087-86593-047.dmg 087-86715-047.dmg DeviceTree.d22ap.im4p; do
+            python3 -I tools/remotezip.py "$url" "$p" "$W/ipsw"
+          done
+          find "$W/ipsw" -type f -exec ls -l {} +
+
+      - name: Build the HFS+ root (tools/mkiosroot.sh)
+        run: |
+          f() { find "$W/ipsw" -name "$1" | head -1; }
+          bash tools/mkiosroot.sh "$(f 087-86698-044.dmg)" "$(f 087-86593-047.dmg)" "$(f 087-86715-047.dmg)" "$W/iosroot.img" 16G 2>&1 |
+            grep -v -e '^linked ' -e 'Illegal name' | tail -60
+          test "${PIPESTATUS[0]}" = 0
+
+      - name: Tweaks (tools/sweet-root-tweaks.py)
+        run: |
+          sudo fsck.hfsplus -fy "$W/iosroot.img" | grep -v 'Illegal name' || true
+          mkdir -p "$W/mnt"
+          sudo mount -t hfsplus -o loop,force "$W/iosroot.img" "$W/mnt"
+          sudo python3 -I tools/sweet-root-tweaks.py "$W/mnt" || { sudo umount "$W/mnt"; exit 1; }
+          df -h "$W/mnt"
+          sudo umount "$W/mnt"
+          sudo fsck.hfsplus -f -y "$W/iosroot.img" | grep -v 'Illegal name' || true
+          sudo fsck.hfsplus -f -n "$W/iosroot.img" || echo "warning: fsck_hfs still reports minor issues; continuing"
+          python3 -c "import sys; b=open(sys.argv[1],'rb').read(1026)[1024:]; print('HFS+ signature', b); sys.exit(b not in (b'H+', b'HX'))" "$W/iosroot.img"
+
+      - name: d22ap.adt and per-GiB checksums
+        run: |
+          im4p=$(find "$W/ipsw" -name DeviceTree.d22ap.im4p | head -1)
+          python3 - "$im4p" "$W/d22ap.adt" <<'PY'
+          import sys
+          b = open(sys.argv[1], 'rb').read()
+          def tlv(o):
+              t = b[o]; l = b[o + 1]; o += 2
+              if l & 0x80:
+                  n = l & 0x7f; l = int.from_bytes(b[o:o + n], 'big'); o += n
+              return t, o, l
+          t, o, l = tlv(0); assert t == 0x30
+          end = o + l
+          while o < end:
+              t, vo, vl = tlv(o)
+              if t == 0x04:
+                  data = b[vo:vo + vl]
+                  out = sys.argv[2] + ('.lzfse' if data[:4] == b'bvx2' else '')
+                  open(out, 'wb').write(data); print(out, len(data)); break
+              o = vo + vl
+          PY
+          if [ -f "$W/d22ap.adt.lzfse" ]; then /tmp/lzfse-bin -decode -i "$W/d22ap.adt.lzfse" -o "$W/d22ap.adt"; fi
+          python3 -I tools/adt.py dump "$W/d22ap.adt" | grep -q product && echo "d22ap.adt parses, /product present"
+          python3 - "$W/iosroot.img" "$W/iosroot.gib.sha256" <<'PY'
+          import hashlib, sys
+          with open(sys.argv[1], 'rb') as f, open(sys.argv[2], 'w') as o:
+              i = 0
+              while True:
+                  h = hashlib.sha256(); n = 0
+                  while n < 1 << 30:
+                      c = f.read(1 << 22)
+                      if not c: break
+                      h.update(c); n += len(c)
+                  if not n: break
+                  o.write(f'{i} {h.hexdigest()}\n'); i += 1
+          print(i, 'GiB')
+          PY
+
+      - name: Compress + encrypt + split (never in the clear)
+        env:
+          ROOTKEY: ${{ secrets.IOSROOT_KEY }}
+        run: |
+          mkdir -p "$W/out"
+          enc() { openssl enc -aes-256-ctr -pbkdf2 -iter 200000 -md sha256 -salt -pass env:ROOTKEY; }
+          pigz -6 -c "$W/iosroot.img" | enc | split -b 1900m -d -a 2 - "$W/out/iosroot.img.gz.enc."
+          tar -C "$W" -cf - d22ap.adt | enc > "$W/out/d22ap.tar.enc"
+          cp "$W/iosroot.gib.sha256" "$W/out/"
+          (cd "$W/out" && sha256sum iosroot.img.gz.enc.* d22ap.tar.enc > PARTS.sha256)
+          rm -f "$W/iosroot.img" "$W/d22ap.adt"
+          ls -l "$W/out"; cat "$W/out/PARTS.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iosroot-encrypted
+          path: /mnt/w/out/
+          retention-days: 1
+          compression-level: 0
