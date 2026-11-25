@@ -1,0 +1,128 @@
+bramble (1203): panel sleep on display off: DCS 28/10 after the fade, 11/29 at power on,
+through the brightness command DMA; autorefresh paused while asleep. sweetpanelsleep=0 turns it off.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 8358606..60056b6 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -455,6 +455,17 @@ public:
+ 	bool           dsiDcs(const uint8_t *payload, uint32_t len);
+ 	void           blSet(uint32_t level);
+ 	static void    blLoop(void *arg);
++	/*
++	 * 1203 (bramble): panel sleep on display off (sweetpanelsleep, default on). The blLoop thread sends
++	 * DCS 28 (display off) + 10 (sleep in) once the off fade is black, and 11 (sleep out) + 29 (display on)
++	 * at power on, through the same command DMA as brightness (one DSI command at a time, between frames).
++	 */
++	uint32_t       fPanelWant;      /* 0 nothing, 1 sleep, 2 wake */
++	bool           fPanelAsleep;
++	bool           fPanelSleepOn;
++	uint32_t       fPanelAR;        /* autorefresh saved at sleep in */
++	void           panelReq(bool sleep);
++	bool           dcsShort(uint8_t cmd);
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	using IOMobileFramebuffer::copyProperty;
+ 	OSPtr<OSObject> copyProperty(const char *aKey) const APPLE_KEXT_OVERRIDE;      /* 1099: kern.sweet_bl_trace */
+@@ -805,8 +816,34 @@ AppleCLCD::blLoop(void *arg)
+ 			IOLockSleep(fb->fBlLock, &fb->fBlReq, THREAD_UNINT);
+ 		}
+ 		fb->fBlReq = false;
+-		uint32_t want = fb->fBlWant;
++		uint32_t want = fb->fBlWant, pw = fb->fPanelWant;
++		fb->fPanelWant = 0;
+ 		IOLockUnlock(fb->fBlLock);
++		if (pw == 1 && !fb->fPanelAsleep) {             /* 1203: sleep in */
++			uint32_t ar = sweet_mdp_rd(SWEET_INTF1 + INTF_TEAR_AUTOREFRESH);
++			if (ar >> 31) {
++				fb->fPanelAR = ar;              /* pause autorefresh: a sleeping panel sends no TE */
++				sweet_mdp_wr(SWEET_INTF1 + INTF_TEAR_AUTOREFRESH, 0);
++				IODelay(30000);
++			}
++			bool a = fb->dcsShort(0x28);
++			IODelay(20000);
++			bool b = fb->dcsShort(0x10);
++			IODelay(120000);
++			fb->fPanelAsleep = true;
++			printf("SWEET PANEL: sleep in (28 %d, 10 %d)\n", a, b);
++		} else if (pw == 2 && fb->fPanelAsleep) {       /* 1203: sleep out */
++			bool a = fb->dcsShort(0x11);
++			IODelay(120000);
++			bool b = fb->dcsShort(0x29);
++			IODelay(20000);
++			if (fb->fPanelAR >> 31) {
++				sweet_mdp_wr(SWEET_INTF1 + INTF_TEAR_AUTOREFRESH, fb->fPanelAR);
++			}
++			fb->fPanelAsleep = false;
++			fb->fBlHave = 0;                        /* send the level again */
++			printf("SWEET PANEL: sleep out (11 %d, 29 %d)\n", a, b);
++		}
+ 		if (want == fb->fBlHave || fb->fBlFails >= 3) {
+ 			continue;
+ 		}
+@@ -841,9 +878,36 @@ AppleCLCD::blSet(uint32_t level)
+ 	IOLockUnlock(fBlLock);
+ }
+ 
++/* 1203: DCS short write, no parameter (data type 05, last) */
++bool
++AppleCLCD::dcsShort(uint8_t cmd)
++{
++	if (cmd != 0x28 && cmd != 0x10 && cmd != 0x11 && cmd != 0x29) {
++		return false;
++	}
++	const uint8_t pkt[4] = { cmd, 0x00, 0x05, 0x80 };
++	return dsiSend(pkt, sizeof(pkt));
++}
++
++void
++AppleCLCD::panelReq(bool sleep)
++{
++	if (fBlLock == NULL || !fPanelSleepOn) {
++		return;
++	}
++	IOLockLock(fBlLock);
++	fPanelWant = sleep ? 1 : 2;
++	fBlReq = true;
++	IOLockWakeup(fBlLock, &fBlReq, false);
++	IOLockUnlock(fBlLock);
++}
++
+ bool
+ AppleCLCD::blStart(void)
+ {
++	uint32_t ps = 1;
++	PE_parse_boot_argn("sweetpanelsleep", &ps, sizeof(ps));
++	fPanelSleepOn = ps != 0;
+ 	uint32_t on = 1;
+ 	PE_parse_boot_argn("sweetbl_dcs", &on, sizeof(on));
+ 	if (!on) {
+@@ -1426,6 +1490,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			fb->fFadeStep = step + 1;
+ 		}
+ 		IOLockUnlock(fb->fLock);
++		if (step == 6) {
++			fb->panelReq(true);     /* 1203: black after this step */
++		}
+ 		if (step <= 6) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+ 				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+@@ -6163,6 +6230,9 @@ AppleCLCD::fbCmd(const char *s, const char *end)
+ 				}
+ 			}
+ 			IOLockUnlock(fLock);
++			if (!off) {
++				panelReq(false);        /* 1203 */
++			}
+ 			if (off && sweet_scan_live()) {
+ 				sweet_scan_leave(this, "display off");  /* 0989: the fade goes through the panel buffer */
+ 			}
+@@ -7311,6 +7381,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				}
+ 			}
+ 			IOLockUnlock(fFB->fLock);
++			if (!off) {
++				fFB->panelReq(false);   /* 1203 */
++			}
+ 			if (off && sweet_scan_live()) {
+ 				sweet_scan_leave(fFB, "display off");  /* 0989: the fade goes through the panel buffer */
+ 			}
