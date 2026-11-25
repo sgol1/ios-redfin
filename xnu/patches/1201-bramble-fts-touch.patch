@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
-index 33231ca..f186f50 100644
+index 33231ca..f1cf6d2 100644
 --- a/bsd/dev/sweet_fts.c
 +++ b/bsd/dev/sweet_fts.c
 @@ -10,6 +10,15 @@
@@ -179,7 +179,7 @@ index 33231ca..f186f50 100644
  	uint8_t id[4] = {0};
  	int ierr = fts_reg_read(FTS_ADDR_CHIPID, id, sizeof(id));
  	printf("SWEET FTS: chip id err=%d %02x %02x fw %02x %02x (want 36 39)\n",
-@@ -531,6 +536,15 @@ fts_thread(void *arg, wait_result_t result)
+@@ -531,6 +536,34 @@ fts_thread(void *arg, wait_result_t result)
  		}
  		printf("SWEET FTS: system reset: ready err=%d\n", err);
  	}
@@ -192,10 +192,29 @@ index 33231ca..f186f50 100644
 +	uint8_t prescan[7] = {FTS_CMD_HW_W, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00};
 +	err = fts_xfer(prescan, sizeof(prescan));
 +	printf("SWEET FTS: pre-scan register write err=%d\n", err);
++	/*
++	 * bramble (1201, b5): with the pre-scan write the IC still only sent the sense-on
++	 * force-cal status, never a pointer. Google's driver (redbull fts.c) has custom
++	 * commands for exactly that state: enable_prox_palm_only_mode() "keeps active
++	 * sensing but only reports status and gesture events and stops reporting pointer
++	 * location" (C0 0D <enable>), and the motion filter (C0 05 <1 = unfiltered>).
++	 * Both RAM-only settings in the IC (no flash writes). fts_flametouchx bit 1 skips them.
++	 */
++	{
++		unsigned fx = 0;
++		(void)PE_parse_boot_argn("flametouchx", &fx, sizeof(fx));
++		if (!(fx & 2u)) {
++			uint8_t palm_off[3] = {0xc0, 0x0d, 0x00};
++			uint8_t mf_off[3] = {0xc0, 0x05, 0x01};
++			int e1 = fts_xfer(palm_off, sizeof(palm_off));
++			int e2 = fts_xfer(mf_off, sizeof(mf_off));
++			printf("SWEET FTS: prox-palm-only off err=%d, motion filter off err=%d\n", e1, e2);
++		}
++	}
  	/* Sense on: scan mode active, all scans the config supports. */
  	uint8_t scan[3] = {FTS_CMD_SCAN, 0x00, 0xff};
  	err = fts_xfer(scan, sizeof(scan));
-@@ -544,7 +558,12 @@ fts_thread(void *arg, wait_result_t result)
+@@ -544,7 +577,25 @@ fts_thread(void *arg, wait_result_t result)
  		/* The IRQ line (active low) says the FIFO holds events; also read
  		 * every ~100 ms in case the line does not work as assumed. */
  		bool poll = (++ticks % 12u) == 0;
@@ -204,12 +223,25 @@ index 33231ca..f186f50 100644
 +		if (ticks % 625u == 0) {
 +			printf("SWEET FTS: 5s: events %u errors %u irq-pin %u\n", events, errors,
 +			    fts_rd(ft.west, FTS_GPIO_IO(FTS_PIN_IRQ)) & 1u);
++			/* b5 diagnosis: drain whatever the FIFO holds, raw, up to 8 events */
++			for (unsigned k = 0; k < 8 && !ft.dead; ++k) {
++				uint8_t dv[8];
++				if (fts_event(dv) || dv[0] == FTS_EVT_NONE) {
++					if (k == 0) {
++						printf("SWEET FTS: fifo empty (%02x %02x)\n", dv[0], dv[1]);
++					}
++					break;
++				}
++				fts_log_event("fifo", dv);
++				events++;
++				fts_handle(dv);
++			}
 +		}
 +		while ((poll || !(fts_rd(ft.west, FTS_GPIO_IO(FTS_PIN_IRQ)) & 1u)) && !ft.dead) {
  			poll = false;
  			if (fts_event(ev)) {
  				if ((errors++ % 100u) == 0) {
-@@ -572,9 +591,8 @@ out:
+@@ -572,9 +623,8 @@ out:
  void
  sweet_fts_init(void)
  {

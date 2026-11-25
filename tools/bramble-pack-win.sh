@@ -23,6 +23,18 @@ base="$base unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checki
 base="$base wdt=-1 sweetfb_noconsole=1 sweetfb_hz=60 ufslogsecs=2 flamereboot=1800"
 base="$base flametouch=1 flametouchdelay=20 sweettouch=0 sweetkeys=1 sweetusb=2 sweetgpu=0 sweetgpufreq=3 sweetgpudelay=0 sweetfb_thread=0 sweetmtl=0 sweetddr=0"
 base="$base sweetbattery=1 sectouch=0"
+# PRESET=fast: the redfin known-good speed settings that need no extra userland (state/redfin.toml bootargs):
+# GPU compositing + present thread + DDR vote, 625 MHz GPU, CPU governor + big-core placement, double-buffered
+# flips, and no kprintf spam. Metal (sweetmtl=2) stays off: it needs the Metal bundles in the iOS root.
+if [[ ${PRESET:-} == fast ]]; then
+	base=$(printf '%s\n' $base | grep -v -x -e '-enable_kprintf_spam' -e 'sweetgpu=.*' -e 'sweetgpufreq=.*' \
+		-e 'sweetfb_thread=.*' -e 'sweetddr=.*' | tr '\n' ' ')
+	base="$base sweetgpu=1 sweetgpufreq=4 sweetfb_thread=1 sweetddr=1 flamecpufreq=2 sweetgov=4060 sweetbig=2 sweetfbflip=1"
+	# smooth backlight (DCS 0x51 via 0906/0973; sofef01 uses the same 10-bit command, NOTES.md Panel)
+	base="$base sweetbl=1"
+elif [[ -n ${PRESET:-} ]]; then
+	echo "unknown PRESET=$PRESET (fast)" >&2; exit 1
+fi
 for a in "$@"; do
 	k=${a%%=*}
 	base=$(printf '%s\n' $base | grep -v -x -e "$k" -e "$k=.*" | tr '\n' ' ')
