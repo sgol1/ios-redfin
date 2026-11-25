@@ -1,0 +1,17 @@
+bramble (1204): the second CS35L41 (0x41) resets on PM8150L GPIO10 (live DT), not PM7250B GPIO11.
+
+diff --git a/bsd/dev/sweet_cs35l41.c b/bsd/dev/sweet_cs35l41.c
+index d9cdf84..8dfad94 100644
+--- a/bsd/dev/sweet_cs35l41.c
++++ b/bsd/dev/sweet_cs35l41.c
+@@ -78,7 +78,9 @@ static const struct {
+ 	const char *name;
+ } allowed[3] = {
+ 	{ 4, 0xca, "PM8150L GPIO11 (CS35L41 0x40 reset)" },
+-	{ 2, 0xca, "PM7250B GPIO11 (CS35L41 0x41 reset)" },
++	/* bramble (1204): the 0x41 amp resets on PM8150L GPIO10 (live DT reset_pin_bottom_default, power-source 1),
++	 * not redfin proto1_1's PM7250B GPIO11 */
++	{ 4, 0xc9, "PM8150L GPIO10 (CS35L41 0x41 reset, bramble)" },
+ 	{ 2, 0xc5, "PM7250B GPIO6 (audio LDO, mic 1)" },
+ };
+ 
