@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
-index 33231ca..ef16711 100644
+index 33231ca..445a81f 100644
 --- a/bsd/dev/sweet_fts.c
 +++ b/bsd/dev/sweet_fts.c
 @@ -10,6 +10,15 @@
@@ -113,7 +113,7 @@ index 33231ca..ef16711 100644
  		return false;
  	}
  	ft.fifo_words = (tx >> 16) & 0x3fu;
-@@ -465,6 +474,225 @@ fts_release_all(void)
+@@ -465,6 +474,252 @@ fts_release_all(void)
  	ft.active = 0;
  }
  
@@ -191,6 +191,11 @@ index 33231ca..ef16711 100644
 +}
 +
 +static bool fts_frame_down;
++/* b10: sense columns to ignore (b9: all 3937 detections were sense 16 noise bursts), and the
++ * minimum number of nodes in the 3x3 that rise at least thr/2 (a fingertip spans several nodes) */
++static unsigned fts_frame_mask = 1u << 16, fts_frame_min = 3;
++static int fts_peak_v, fts_peak_f, fts_peak_s;
++static unsigned fts_peak_n;
 +static int fts_frame_x, fts_frame_y;
 +
 +static void
@@ -226,6 +231,12 @@ index 33231ca..ef16711 100644
 +		}
 +		return;
 +	}
++	for (unsigned i = 0; i < n; ++i) {
++		unsigned c = i % s;
++		if (c < 32 && (fts_frame_mask & (1u << c))) {
++			fts_frame[i] = (int16_t)(base16[i] / 16);   /* masked column: no rise */
++		}
++	}
 +	int maxv = 0;
 +	for (unsigned i = 0; i < n; ++i) {
 +		int d = fts_frame[i] - base16[i] / 16;
@@ -234,7 +245,23 @@ index 33231ca..ef16711 100644
 +			best = i;
 +		}
 +	}
-+	if (maxv < thr) {
++	unsigned blob = 0;
++	for (int df = -1; df <= 1; ++df) {
++		for (int ds = -1; ds <= 1; ++ds) {
++			int ff = (int)(best / s) + df, ss = (int)(best % s) + ds;
++			if (ff >= 0 && ss >= 0 && ff < (int)f && ss < (int)s &&
++			    2 * (fts_frame[ff * (int)s + ss] - base16[ff * (int)s + ss] / 16) >= thr) {
++				blob++;
++			}
++		}
++	}
++	if (maxv > fts_peak_v) {
++		fts_peak_v = maxv;
++		fts_peak_f = (int)(best / s);
++		fts_peak_s = (int)(best % s);
++		fts_peak_n = blob;
++	}
++	if (maxv < thr || blob < fts_frame_min) {
 +		for (unsigned i = 0; i < n; ++i) {
 +			base16[i] += (fts_frame[i] * 16 - base16[i]) / 32;
 +		}
@@ -280,7 +307,7 @@ index 33231ca..ef16711 100644
 +	fts_frame_x = x;
 +	fts_frame_y = y;
 +	if (!fts_frame_down && ft.log) {
-+		printf("SWEET FTS: frame touch down %d,%d (max %d at %d/%d)\n", x, y, maxv, bf, bs);
++		printf("SWEET FTS: frame touch down %d,%d (max %d at %d/%d, %u nodes)\n", x, y, maxv, bf, bs, blob);
 +	}
 +	fts_frame_down = true;
 +	sweet_hid_touch(0, 1, x, y);
@@ -339,7 +366,7 @@ index 33231ca..ef16711 100644
  static void
  fts_thread(void *arg, wait_result_t result)
  {
-@@ -475,46 +703,42 @@ fts_thread(void *arg, wait_result_t result)
+@@ -475,46 +730,42 @@ fts_thread(void *arg, wait_result_t result)
  	printf("SWEET FTS: starting in %u s\n", delay_s);
  	fts_wait(delay_s * 1000u);
  	ft.gcc = ml_io_map(FTS_GCC_PA, 0x60000);
@@ -405,7 +432,7 @@ index 33231ca..ef16711 100644
  	uint8_t id[4] = {0};
  	int ierr = fts_reg_read(FTS_ADDR_CHIPID, id, sizeof(id));
  	printf("SWEET FTS: chip id err=%d %02x %02x fw %02x %02x (want 36 39)\n",
-@@ -531,20 +755,106 @@ fts_thread(void *arg, wait_result_t result)
+@@ -531,20 +782,113 @@ fts_thread(void *arg, wait_result_t result)
  		}
  		printf("SWEET FTS: system reset: ready err=%d\n", err);
  	}
@@ -480,6 +507,9 @@ index 33231ca..ef16711 100644
 +	(void)PE_parse_boot_argn("flametouchframe", &frame_mode, sizeof(frame_mode));
 +	(void)PE_parse_boot_argn("flametouchthr", &frame_thr, sizeof(frame_thr));
 +	(void)PE_parse_boot_argn("flametouchrot", &frame_rot, sizeof(frame_rot));
++	(void)PE_parse_boot_argn("flametouchmask", &fts_frame_mask, sizeof(fts_frame_mask));
++	(void)PE_parse_boot_argn("flametouchmin", &fts_frame_min, sizeof(fts_frame_min));
++	printf("SWEET FTS: frame mask 0x%x, min nodes %u\n", fts_frame_mask, fts_frame_min);
 +	printf("SWEET FTS: frame touch %s (thr %d, rot %u)\n", frame_mode ? "on" : "off", frame_thr, frame_rot);
  	while (!ft.dead) {
  		uint8_t ev[8];
@@ -492,6 +522,10 @@ index 33231ca..ef16711 100644
 +		}
 +		/* bramble: one status line every ~5 s (625 x 8 ms) */
 +		if (ticks % 625u == 0) {
++			if (frame_mode) {
++				printf("SWEET FTS: 5s frame peak %d at %d/%d (%u nodes)\n", fts_peak_v, fts_peak_f, fts_peak_s, fts_peak_n);
++				fts_peak_v = 0;
++			}
 +			printf("SWEET FTS: 5s: events %u errors %u irq-pin %u\n", events, errors,
 +			    fts_rd(ft.west, FTS_GPIO_IO(FTS_PIN_IRQ)) & 1u);
 +			fts_strength_probe();
@@ -513,7 +547,7 @@ index 33231ca..ef16711 100644
  			poll = false;
  			if (fts_event(ev)) {
  				if ((errors++ % 100u) == 0) {
-@@ -572,9 +882,8 @@ out:
+@@ -572,9 +916,8 @@ out:
  void
  sweet_fts_init(void)
  {
