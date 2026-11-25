@@ -1,0 +1,26 @@
+bramble (1206): colour management on from boot (sweetcm, default 1): Night Shift / True Tone through 1116 SetMatrix on the DSPP PCC.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 60056b6..bd51187 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -878,6 +878,8 @@ AppleCLCD::blSet(uint32_t level)
+ 	IOLockUnlock(fBlLock);
+ }
+ 
++extern "C" uint32_t sweet_cm;   /* 1206: defined with 1116's colour management below */
++
+ /* 1203: DCS short write, no parameter (data type 05, last) */
+ bool
+ AppleCLCD::dcsShort(uint8_t cmd)
+@@ -907,6 +909,10 @@ AppleCLCD::blStart(void)
+ {
+ 	uint32_t ps = 1;
+ 	PE_parse_boot_argn("sweetpanelsleep", &ps, sizeof(ps));
++	/* 1206 (bramble): Night Shift / True Tone: CoreBrightness's SetMatrix on the DSPP PCC (1116 kern.sweet_cm) from boot */
++	uint32_t cm = 1;
++	PE_parse_boot_argn("sweetcm", &cm, sizeof(cm));
++	sweet_cm = cm;
+ 	fPanelSleepOn = ps != 0;
+ 	uint32_t on = 1;
+ 	PE_parse_boot_argn("sweetbl_dcs", &on, sizeof(on));
