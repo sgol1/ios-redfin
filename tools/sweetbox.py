@@ -125,6 +125,46 @@ def build(udir, launchd, out):
     print(f'{out}: seq {seq}, {len(b.ents)} entries, {len(blob) >> 20} MiB, sha256 {hashlib.sha256(blob).hexdigest()[:16]}')
 
 
+def build_hexagon(src, out):
+    """Second box: fastrpcd's tree /private/var/local/hexagon (as tools/redfin-install-hexagon-wsl.sh stages it)
+    from SRC/vendor.tar (dsp, lib/rfsa, etc/acdbdata, etc/sensors of bramble's vendor), SRC/persist.tar
+    (sensors/ of the persist partition) and SRC/soc0.txt (name=value of /sys/devices/soc0)."""
+    import tarfile
+    H = '/private/var/local/hexagon'
+    files = {}
+    with tarfile.open(os.path.join(src, 'vendor.tar')) as t:
+        for m in t:
+            parts = [p for p in m.name.split('/') if p not in ('', '.')]
+            if not m.isreg() or '..' in parts:
+                continue
+            data = t.extractfile(m).read()
+            files['vendor/' + '/'.join(parts)] = data
+            if parts[:2] == ['dsp', 'adsp']:
+                files['usr/lib/qcom/adsp/' + '/'.join(parts[2:])] = data
+    with tarfile.open(os.path.join(src, 'persist.tar')) as t:
+        for m in t:
+            parts = [p for p in m.name.split('/') if p not in ('', '.')]
+            if m.isreg() and '..' not in parts and parts[:1] == ['sensors']:
+                files['persist/' + '/'.join(parts)] = t.extractfile(m).read()
+    for line in open(os.path.join(src, 'soc0.txt'), encoding='utf-8'):
+        k, _, v = line.rstrip('\n').partition('=')
+        if k and '/' not in k:
+            files['sys/devices/soc0/' + k] = (v + '\n').encode()
+    b = Box()
+    dirs = {'/private/var/local', H}
+    for rel in files:
+        p = rel.split('/')[:-1]
+        for i in range(1, len(p) + 1):
+            dirs.add(H + '/' + '/'.join(p[:i]))
+    for d in sorted(dirs, key=lambda x: (x.count('/'), x)):
+        b.d(d)
+    for rel in sorted(files):
+        b.f(f'{H}/{rel}', files[rel])
+    blob, seq = b.blob()
+    open(out, 'wb').write(blob)
+    print(f'{out}: seq {seq}, {len(files)} files, {len(dirs)} dirs, {len(blob) >> 20} MiB')
+
+
 def write(box):
     data = open(box, 'rb').read()
     size = int(subprocess.run(['adb', 'shell', f'blockdev --getsize64 {DEV}'], capture_output=True, env=ENV,
@@ -158,6 +198,8 @@ if __name__ == '__main__':
     a = sys.argv[1:]
     if a[:1] == ['build'] and len(a) == 4:
         build(*a[1:])
+    elif a[:1] == ['hexagon'] and len(a) == 3:
+        build_hexagon(*a[1:])
     elif a[:1] == ['write'] and len(a) == 2:
         write(a[1])
     elif a[:1] == ['check'] and len(a) == 2:
