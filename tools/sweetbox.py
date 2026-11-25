@@ -134,14 +134,12 @@ def write(box):
     vol = struct.unpack('>I', hdr[40:44])[0] * struct.unpack('>I', hdr[44:48])[0]
     if hdr[:2] not in (b'H+', b'HX') or vol > OFF or OFF + len(data) > size - (32 << 20):
         sys.exit(f'refused: volume {vol >> 30} GiB, partition {size >> 30} GiB, box {len(data) >> 20} MiB at 32 GiB')
-    p = subprocess.Popen(['adb', 'exec-in', f'dd of={DEV} bs=65536 seek={OFF // 65536} 2>/dev/null'],
-                         stdin=subprocess.PIPE, env=ENV)
-    for i in range(0, len(data), 1 << 22):
-        p.stdin.write(data[i:i + (1 << 22)])
-    p.stdin.close()
-    if p.wait():
-        sys.exit('adb exec-in failed')
-    subprocess.run(['adb', 'shell', 'sync'], env=ENV, stdin=subprocess.DEVNULL)
+    # adb exec-in from Windows delivered nothing to dd (2026-11-25): push to TWRP's RAM /tmp, then dd from there
+    subprocess.run(['adb', 'push', box, '/tmp/sweetbox.bin'], env=ENV, stdin=subprocess.DEVNULL, check=True)
+    r = subprocess.run(['adb', 'shell', f'dd if=/tmp/sweetbox.bin of={DEV} bs=65536 seek={OFF // 65536} '
+                        f'conv=notrunc && sync; rm -f /tmp/sweetbox.bin'], env=ENV, stdin=subprocess.DEVNULL)
+    if r.returncode:
+        sys.exit('dd on the phone failed')
     check(box)
 
 
