@@ -94,6 +94,7 @@ jobs:
       - name: wland + phone tools
         run: |
           cd repo
+          mkdir -p work/userland/bin && cp "$HOME/bin/ios-cc" work/userland/bin/ios-cc   # the phone/*/build.sh path
           sh phone/wifi/build.sh
           cp phone/wifi/out/wland ../out/
           sh phone/locd/test/run.sh > ../out/sweetlocd-test.log 2>&1 || { echo "::warning::sweetlocd host tests failed"; tail -20 ../out/sweetlocd-test.log; }
