@@ -7,6 +7,11 @@ name: userland
 
 on:
   workflow_dispatch:
+    inputs:
+      runner:
+        description: runner label
+        required: false
+        default: macos-15
   push:
     branches: [sunfish, redfin]
     paths: [.github/workflows/userland.yml, "phone/**"]
@@ -21,7 +26,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: ${{ inputs.runner || 'macos-15' }}
     timeout-minutes: 30
     steps:
       - name: Toolchain
@@ -128,7 +133,7 @@ jobs:
       # The kernel also goes to branch builds-userland (one force-pushed commit), so it can be fetched with git
       # where artifact downloads are blocked: git fetch --depth 1 origin builds-userland
       - name: Publish to the builds-userland branch
-        if: success()
+        if: success() && github.ref_name != 'bramble'   # bramble: artifact only, no branch push
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
