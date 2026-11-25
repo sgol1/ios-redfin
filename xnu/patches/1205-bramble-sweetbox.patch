@@ -1,7 +1,7 @@
 bramble (1205): sweetbox: at boot, write the files TWRP left in userdata 32 GiB in (past the 16 GiB HFS volume) into the root; once per seq.
 
 diff --git a/bsd/dev/sweet_files.c b/bsd/dev/sweet_files.c
-index fc707ce..855516d 100644
+index fc707ce..c7d70f5 100644
 --- a/bsd/dev/sweet_files.c
 +++ b/bsd/dev/sweet_files.c
 @@ -45,6 +45,7 @@
@@ -12,7 +12,7 @@ index fc707ce..855516d 100644
  
  extern int sweet_vfs_mkdir(const char *path, int mode);
  extern int sweet_vfs_symlink(const char *target, const char *link);
-@@ -475,4 +476,199 @@ sweet_files_start(void)
+@@ -475,4 +476,204 @@ sweet_files_start(void)
  		thread_deallocate(thread);
  	}
  }
@@ -22,7 +22,7 @@ index fc707ce..855516d 100644
 + * kernel has no HFS+. TWRP (RAM) writes a bundle with dd into userdata 32 GiB in, past the 16 GiB HFS
 + * volume and far from the tail; at boot this thread checks it and writes its files into the root.
 + *   header (4 KiB): "SWEETBOX" | u32 version 1 | u32 count | u64 seq | u64 bytes | u32 fnv1a(bytes) | u32 0
-+ *   then count entries: u32 type (1 file, 2 directory) | u32 mode | u32 path length | u32 0 | u64 length,
++ *   then count entries: u32 type (1 file, 2 directory, 3 remove) | u32 mode | u32 path length | u32 0 | u64 length,
 + *   the path (no NUL), padded to 8, the data, padded to 8. Little endian.
 + * Applied once per seq (kept in /private/var/local/.sweetbox); nothing on the raw area is written.
 + * Boot-arg sweetbox=0 skips it.
@@ -180,6 +180,11 @@ index fc707ce..855516d 100644
 +		} else if (e.type == 1) {
 +			err = sb_put(path, (int)(e.mode & 07777), data, e.len);
 +			files++;
++		} else if (e.type == 3) {
++			err = sweet_vfs_unlink(path);
++			if (err == ENOENT) {
++				err = 0;
++			}
 +		} else {
 +			err = EINVAL;
 +		}
