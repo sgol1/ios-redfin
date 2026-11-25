@@ -41,7 +41,11 @@ for a in "$@"; do
 done
 cmdline="${base% }${*:+ $*}"
 echo "$cmdline" > "$P/$name.cmdline"
-python -I tools/mkadt.py "$P/bramble-hi.adt" --highmem
+# PRESET=fast also adds the /backlight node (mkadt --backlight, 500 nits = sofef01's max, NOTES.md Panel): with
+# sweetbl=1, CoreBrightness then dims with the panel's own brightness instead of redrawing darker frames.
+adtflags=(--highmem)
+[[ ${PRESET:-} == fast ]] && adtflags+=(--backlight)
+python -I tools/mkadt.py "$P/bramble-hi.adt" "${adtflags[@]}"
 python -I "$SCRATCH" tools "$kernel" "$P/bramble-hi.adt" "$P/$name.payload" --cmdline "$cmdline" --gpufw fw-bramble >/dev/null
 PYTHONPATH=downloads/mkbootimg python downloads/mkbootimg/mkbootimg.py --header_version 3 \
 	--kernel work/shim-ci/u-probe/kernel --ramdisk "$P/$name.payload" \
