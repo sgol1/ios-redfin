@@ -1,0 +1,249 @@
+bramble (1205): sweetbox: at boot, write the files TWRP left in userdata 32 GiB in (past the 16 GiB HFS volume) into the root; once per seq.
+
+diff --git a/bsd/dev/sweet_files.c b/bsd/dev/sweet_files.c
+index fc707ce..855516d 100644
+--- a/bsd/dev/sweet_files.c
++++ b/bsd/dev/sweet_files.c
+@@ -45,6 +45,7 @@
+ #include <kern/locks.h>
+ #include <mach/mach_time.h>
+ #include <kern/clock.h>
++#include <pexpert/pexpert.h>
+ 
+ extern int sweet_vfs_mkdir(const char *path, int mode);
+ extern int sweet_vfs_symlink(const char *target, const char *link);
+@@ -475,4 +476,199 @@ sweet_files_start(void)
+ 		thread_deallocate(thread);
+ 	}
+ }
++
++/*
++ * bramble (1205): sweetbox. Windows has no CDC-ECM driver, so tcp 2223 is out of reach, and TWRP's
++ * kernel has no HFS+. TWRP (RAM) writes a bundle with dd into userdata 32 GiB in, past the 16 GiB HFS
++ * volume and far from the tail; at boot this thread checks it and writes its files into the root.
++ *   header (4 KiB): "SWEETBOX" | u32 version 1 | u32 count | u64 seq | u64 bytes | u32 fnv1a(bytes) | u32 0
++ *   then count entries: u32 type (1 file, 2 directory) | u32 mode | u32 path length | u32 0 | u64 length,
++ *   the path (no NUL), padded to 8, the data, padded to 8. Little endian.
++ * Applied once per seq (kept in /private/var/local/.sweetbox); nothing on the raw area is written.
++ * Boot-arg sweetbox=0 skips it.
++ */
++#define SB_OFF          0x800000000ULL
++#define SB_MAX_BYTES    (3ULL << 30)
++#define SB_SEQ_PATH     "/private/var/local/.sweetbox"
++extern int sweet_ufs_raw_read(uint64_t off, void *buf, uint32_t len);
++extern vnode_t rootvnode;
++static char *sb_buf;	/* its own: sf_buf belongs to the tcp thread */
++
++struct sb_head {
++	char     magic[8];
++	uint32_t version, count;
++	uint64_t seq, bytes;
++	uint32_t sum, pad;
++};
++struct sb_ent {
++	uint32_t type, mode, path_len, pad;
++	uint64_t len;
++};
++
++static uint32_t
++sb_fnv(uint32_t h, const uint8_t *p, size_t n)
++{
++	while (n--) {
++		h ^= *p++;
++		h *= 16777619u;
++	}
++	return h;
++}
++
++static int
++sb_file_io(const char *path, bool wr, void *buf, int len, int mode)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int err = vnode_open(path, wr ? (O_CREAT | O_TRUNC | FWRITE) : FREAD, mode, 0, &vp, ctx);
++	if (err) {
++		return err;
++	}
++	if (wr) {
++		err = vnode_setsize(vp, 0, 0, ctx);
++	}
++	int resid = 0;
++	if (!err) {
++		err = vn_rdwr(wr ? UIO_WRITE : UIO_READ, vp, buf, len, 0, UIO_SYSSPACE, IO_UNIT,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	}
++	vnode_close(vp, wr ? FWRITE : FREAD, ctx);
++	return err ? err : (resid ? EIO : 0);
++}
++
++static int
++sb_put(const char *path, int mode, uint64_t off, uint64_t len)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int err = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, mode & 07777, 0, &vp, ctx);
++	if (!err) {
++		err = vnode_setsize(vp, 0, 0, ctx);
++	}
++	for (uint64_t done = 0; !err && done < len;) {
++		uint32_t n = (uint32_t)MIN((uint64_t)SF_BUF, len - done);
++		err = sweet_ufs_raw_read(SB_OFF + off + done, sb_buf, n);
++		if (!err) {
++			int resid = 0;
++			err = vn_rdwr(UIO_WRITE, vp, sb_buf, (int)n, (off_t)done, UIO_SYSSPACE, IO_UNIT,
++			    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++			if (!err && resid) {
++				err = EIO;
++			}
++		}
++		done += n;
++	}
++	if (vp != NULLVP) {
++		vnode_close(vp, FWRITE, ctx);
++	}
++	if (!err) {
++		err = sf_setattr(path, mode, true);
++	}
++	return err;
++}
++
++static void
++sb_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	vnode_t vp = NULLVP;
++	for (int i = 0; i < 6000 && (rootvnode == NULLVP || vnode_lookup("/private/var", 0, &vp, vfs_context_kernel())); i++) {
++		sf_sleep_ms(20);
++	}
++	if (vp == NULLVP) {
++		printf("SWEET BOX: no root after 120 s\n");
++		goto out;
++	}
++	vnode_put(vp);
++	if (sb_buf == NULL) {
++		sb_buf = kalloc_data(SF_BUF, Z_WAITOK);
++	}
++	struct sb_head h;
++	int err = sweet_ufs_raw_read(SB_OFF, &h, sizeof(h));
++	if (err || memcmp(h.magic, "SWEETBOX", 8) || h.version != 1) {
++		printf("SWEET BOX: none (err %d)\n", err);
++		goto out;
++	}
++	uint64_t seen = 0;
++	(void)sb_file_io(SB_SEQ_PATH, false, &seen, sizeof(seen), 0);
++	if (seen == h.seq) {
++		printf("SWEET BOX: seq %llu already applied\n", h.seq);
++		goto out;
++	}
++	if (h.bytes > SB_MAX_BYTES) {
++		printf("SWEET BOX: %llu bytes: too big\n", h.bytes);
++		goto out;
++	}
++	uint32_t sum = 2166136261u;
++	for (uint64_t off = 0; off < h.bytes;) {
++		uint32_t n = (uint32_t)MIN((uint64_t)SF_BUF, h.bytes - off);
++		if ((err = sweet_ufs_raw_read(SB_OFF + 4096 + off, sb_buf, n))) {
++			printf("SWEET BOX: read error %d at %llu\n", err, off);
++			goto out;
++		}
++		sum = sb_fnv(sum, (const uint8_t *)sb_buf, n);
++		off += n;
++	}
++	if (sum != h.sum) {
++		printf("SWEET BOX: seq %llu checksum %08x, header says %08x: not applied\n", h.seq, sum, h.sum);
++		goto out;
++	}
++	printf("SWEET BOX: seq %llu, %u entries, %llu bytes: applying\n", h.seq, h.count, h.bytes);
++	uint64_t off = 4096;
++	unsigned files = 0, dirs = 0, fails = 0;
++	char path[1024];
++	for (uint32_t i = 0; i < h.count; i++) {
++		struct sb_ent e;
++		if ((err = sweet_ufs_raw_read(SB_OFF + off, &e, sizeof(e))) || e.path_len == 0 || e.path_len >= sizeof(path) ||
++		    off + sizeof(e) + e.path_len + e.len > 4096 + h.bytes) {
++			printf("SWEET BOX: bad entry %u at %llu (err %d)\n", i, off, err);
++			break;
++		}
++		if ((err = sweet_ufs_raw_read(SB_OFF + off + sizeof(e), path, e.path_len))) {
++			break;
++		}
++		path[e.path_len] = 0;
++		uint64_t data = off + sizeof(e) + ((e.path_len + 7u) & ~7u);
++		if (e.type == 2) {
++			err = sweet_vfs_mkdir(path, (int)(e.mode & 07777));
++			if (err == EEXIST) {
++				err = 0;
++			}
++			if (!err) {
++				err = sf_setattr(path, (int)(e.mode & 07777), true);
++			}
++			dirs++;
++		} else if (e.type == 1) {
++			err = sb_put(path, (int)(e.mode & 07777), data, e.len);
++			files++;
++		} else {
++			err = EINVAL;
++		}
++		if (err) {
++			fails++;
++			printf("SWEET BOX: %s: error %d\n", path, err);
++		}
++		off = data + ((e.len + 7u) & ~7ULL);
++	}
++	if (fails == 0) {
++		(void)sweet_vfs_mkdir("/private/var/local", 0755);
++		err = sb_file_io(SB_SEQ_PATH, true, &h.seq, sizeof(h.seq), 0644);
++	}
++	printf("SWEET BOX: seq %llu done: %u files, %u directories, %u failed%s\n", h.seq, files, dirs, fails,
++	    fails ? " (not marked applied: the next boot tries again)" : "");
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void sweet_box_start(void);
++void
++sweet_box_start(void)
++{
++	uint32_t on = 1;
++	PE_parse_boot_argn("sweetbox", &on, sizeof(on));
++	thread_t thread;
++	if (on && kernel_thread_start(sb_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index acf4810..a21f741 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1627,6 +1627,19 @@ sweet_ufs_xfer(uint64_t off, uint32_t count, caddr_t kaddr, bool rd, uint32_t *d
+ 	return error;
+ }
+ 
++/* bramble (1205): partition-relative read for the sweetbox import (bsd/dev/sweet_files.c); reads only */
++int sweet_ufs_raw_read(uint64_t off, void *buf, uint32_t len);
++int
++sweet_ufs_raw_read(uint64_t off, void *buf, uint32_t len)
++{
++	if (!su.ready || len == 0 || off + len < off || off + len > su.nblocks * UFS_BLOCK) {
++		return EINVAL;
++	}
++	uint32_t done = 0;
++	int err = sweet_ufs_xfer(off, len, (caddr_t)buf, true, &done);
++	return err ? err : (done == len ? 0 : EIO);
++}
++
+ static void
+ sweet_ufs_strategy(buf_t bp)
+ {
+@@ -1958,6 +1971,10 @@ sweet_ufs_init(void)
+ 	sweet_nfc_init();	/* 1115/1117: NFC P0 read-only ST54J probe (kern.sweet_nfc_probe=1 or sweetnfc=1; default off): bsd/dev/sweet_nfc.c */
+ 	sweet_abp_init();	/* 1061: AppleBasebandPCI stand-in + /dev/abpbridge (sweetabp=1|2): bsd/dev/sweet_abp.c */
+ 	sweet_usb_probe();
++	{
++		extern void sweet_box_start(void);
++		sweet_box_start();	/* 1205: files TWRP left past the HFS volume (bsd/dev/sweet_files.c) */
++	}
+ 	return 0;
+ }
+ 
